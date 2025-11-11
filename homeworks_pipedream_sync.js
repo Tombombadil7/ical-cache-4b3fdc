@@ -1,12 +1,10 @@
 import { axios } from "@pipedream/platform";
 
 export default defineComponent({
-  name: "Sync Moodle to Todoist (V10 - Dynamic URLs)",
+  name: "Sync Moodle to Todoist (V11 - Optional Git & Start Check)",
   props: {
     db: { type: "data_store" },
     todoist: { type: "app", app: "todoist" },
-    github_token: { type: "string", secret: true },
-    // --- חדש: קישורים דינאמיים ---
     moodle_url: { 
       type: "string", 
       label: "Moodle iCal URL", 
@@ -19,13 +17,14 @@ export default defineComponent({
       secret: true, 
       description: "קישור iCal מלא מאתר הציונים של מדמ\"ח" 
     },
-    // ----------------------------
-    gh_owner: { type: "string", default: "Tombombadil7" },
-    gh_repo: { type: "string", default: "ical-cache-4b3fdc" },
-    gh_path: { type: "string", default: "calendar.ics" },
+    // --- GitHub אופציונלי ---
+    github_token: { type: "string", secret: true, optional: true },
+    gh_owner: { type: "string", optional: true },
+    gh_repo: { type: "string", optional: true },
+    gh_path: { type: "string", default: "calendar.ics", optional: true },
   },
   async run({ $ }) {
-    console.log("🚀 STARTING WORKFLOW V10 (Dynamic URLs)");
+    console.log("🚀 STARTING WORKFLOW V11 (Optional Git & Start Check)");
 
     // --- CONFIGURATION ---
     const COURSE_MAP = {
@@ -35,11 +34,16 @@ export default defineComponent({
     };
     // ---------------------
 
-    const ghHeaders = { Authorization: `token ${this.github_token}`, Accept: "application/vnd.github.v3+json" };
     const todoistHeaders = { Authorization: `Bearer ${this.todoist.$auth.oauth_access_token}`, "Content-Type": "application/json" };
+    // --- MOD 2: בדיקה אם גיטהאב מופעל ---
+    const isGitHubEnabled = this.github_token && this.gh_owner && this.gh_repo;
+    let ghHeaders = null;
+    if (isGitHubEnabled) {
+      ghHeaders = { Authorization: `token ${this.github_token}`, Accept: "application/vnd.github.v3+json" };
+    }
 
     // --- HELPERS ---
-    const extractEvents = (text) => text?.match(/BEGIN:VEVENT[\sS]+?END:VEVENT/gi) || [];
+    const extractEvents = (text) => text?.match(/BEGIN:VEVENT[\s\S]+?END:VEVENT/gi) || [];
     const getField = (block, name) => block.match(new RegExp(`^${name}[:;](.*)$`, "mi"))?.[1].trim();
     const getCourseID = (block) => getField(block, "CATEGORIES")?.match(/(\d{6,9})(?:\.|$)/)?.[1];
     const toISO = (icalDate) => {
@@ -52,21 +56,27 @@ export default defineComponent({
     console.log("\n--- STAGE 1: FETCH ---");
     let allEvents = [];
     let sha = null;
-    try {
-      const res = await axios($, { url: `https://api.github.com/repos/${this.gh_owner}/${this.gh_repo}/contents/${this.gh_path}`, headers: ghHeaders });
-      sha = res.sha;
-      allEvents.push(...extractEvents(Buffer.from(res.content, "base64").toString("utf8")));
-    } catch (e) {}
+    
+    // --- MOD 2: קריאת גיבוי רק אם מופעל ---
+    if (isGitHubEnabled) {
+      try {
+        console.log(`📡 Fetching GitHub cache...`);
+        const res = await axios($, { url: `https://api.github.com/repos/${this.gh_owner}/${this.gh_repo}/contents/${this.gh_path}`, headers: ghHeaders });
+        sha = res.sha;
+        allEvents.push(...extractEvents(Buffer.from(res.content, "base64").toString("utf8")));
+      } catch (e) {
+        console.log("ℹ️ GitHub Cache not found (starting fresh or disabled).");
+      }
+    } else {
+      console.log("⏭️ Skipping GitHub cache read (credentials missing).");
+    }
 
-    // --- שימוש בקישורים מה-Props ---
     const sources = [
       { name: "Moodle", url: this.moodle_url },
       { name: "Grades", url: this.grades_url }
     ];
-    // ---------------------------------
 
     for (const source of sources) {
-      // ודא שהמשתמש הזין קישור לפני הניסיון למשוך אותו
       if (!source.url) {
         console.log(`⏭️ Skipping ${source.name}: No URL provided.`);
         continue;
@@ -81,7 +91,6 @@ export default defineComponent({
     console.log("\n--- STAGE 2: PROCESS ---");
     const openMap = new Map();
     const moodleRegex = /(נפתח ב|תאריך הגשה)[:\s]+(.*)/i;
-    // Index opening times
     allEvents.forEach(e => {
          const cid = getCourseID(e);
          const match = (getField(e, "SUMMARY") || "").replace(/^.*? - /, "").match(moodleRegex);
@@ -98,13 +107,11 @@ export default defineComponent({
       let summary = getField(e, "SUMMARY") || "";
       const match = summary.replace(/^.*? - /, "").match(moodleRegex);
 
-      // Merge start times
       if (cid && match && match[1].includes("תאריך הגשה")) {
         const openTime = openMap.get(`${cid}|${match[2].trim()}`);
         if (openTime) e = e.replace(/^DTSTART[:;].*$/m, `DTSTART:${openTime}`);
       }
 
-      // Rename & Clean
       if (cid && COURSE_MAP[cid] && !summary.startsWith(COURSE_MAP[cid])) summary = `${COURSE_MAP[cid]} - ${summary}`;
       if (/(:| - )(יש להגיש|תאריך הגשה)/.test(summary)) summary = summary.replace(/(יש להגיש|תאריך הגשה)/g, "להגיש");
       e = e.replace(/^(SUMMARY:)(.*)$/m, `$1${summary}`);
@@ -112,23 +119,43 @@ export default defineComponent({
       const uid = getField(e, "UID");
       if (uid) uniqueMap.set(uid, e);
     }
+    // `uniqueMap` מכיל כעת את *כל* המשימות (גם עתידיות) עבור הגיבוי
+    console.log(`✅ Processing complete. ${uniqueMap.size} total events found.`);
 
     // 3. GITHUB SYNC
     console.log("\n--- STAGE 3: GITHUB ---");
-    const finalICS = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TechnionMerged//EN", "METHOD:PUBLISH", ...uniqueMap.values(), "END:VCALENDAR"].join("\r\n");
-    await axios($, {
-      method: "PUT", url: `https://api.github.com/repos/${this.gh_owner}/${this.gh_repo}/contents/${this.gh_path}`, headers: ghHeaders,
-      data: { message: `Sync: ${uniqueMap.size} events`, content: Buffer.from(finalICS).toString("base64"), ...(sha && { sha }) }
-    });
+    // --- MOD 2: כתיבה לגיטהאב רק אם מופעל ---
+    if (isGitHubEnabled) {
+      const finalICS = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TechnionMerged//EN", "METHOD:PUBLISH", ...uniqueMap.values(), "END:VCALENDAR"].join("\r\n");
+      await axios($, {
+        method: "PUT", url: `https://api.github.com/repos/${this.gh_owner}/${this.gh_repo}/contents/${this.gh_path}`, headers: ghHeaders,
+        data: { message: `Sync: ${uniqueMap.size} events`, content: Buffer.from(finalICS).toString("base64"), ...(sha && { sha }) }
+      });
+      console.log(`✅ GitHub push successful (${uniqueMap.size} events).`);
+    } else {
+      console.log("⏭️ Skipping GitHub Sync (credentials missing).");
+    }
 
     // 4. TODOIST SYNC
     console.log("\n--- STAGE 4: TODOIST UPSERT ---");
-    let stats = { created: 0, updated: 0, skipped: 0 };
+    let stats = { created: 0, updated: 0, skipped: 0, skipped_not_started: 0 };
+    const nowISO = new Date().toISOString(); // קביעת הזמן הנוכחי פעם אחת
 
     for (const [uid, event] of uniqueMap.entries()) {
         const end = getField(event, "DTEND");
-        if (!end) continue;
+        if (!end) continue; // דלג אם אין דדליין
+        
         const start = getField(event, "DTSTART");
+        
+        // --- MOD 1: בדיקת תאריך התחלה ---
+        // אם תאריך ההתחלה קיים והוא בעתיד, דלג על יצירה/עדכון ב-Todoist
+        if (start && toISO(start) > nowISO) {
+            console.log(`⏭️ Skipping (Not Started): ${getField(event, "SUMMARY")}`);
+            stats.skipped_not_started++;
+            continue;
+        }
+        // ---------------------------------
+
         const summary = getField(event, "SUMMARY");
         const cid = getCourseID(event);
         const currentSig = `${summary}|${end}|${start || 'N/A'}`;
@@ -143,7 +170,7 @@ export default defineComponent({
         };
 
         try {
-            // Update existing
+            // Update
             if (cached && typeof cached === 'object' && cached.id) {
                 if (cached.sig !== currentSig) {
                     console.log(`🔄 Updating: "${summary}"`);
@@ -153,20 +180,17 @@ export default defineComponent({
                 } else { stats.skipped++; }
                 continue;
             }
-            // Skip legacy cache
             if (cached === true) { stats.skipped++; continue; }
 
-            // Create new
+            // Create
             console.log(`📤 Creating: "${summary}"`);
             const res = await axios($, { method: "post", url: "https://api.todoist.com/rest/v2/tasks", headers: todoistHeaders, data: payload });
-            
-            // Save new state
             await this.db.set(uid, { id: res.id, sig: currentSig });
             stats.created++;
 
         } catch (e) { console.error(`❌ Error on ${uid}: ${e.message}`); }
     }
 
-    return $.export("$summary", `Sync Complete: +${stats.created} created, 🔄 ${stats.updated} updated, ⏭️ ${stats.skipped} skipped.`);
+    return $.export("$summary", `Sync Complete: +${stats.created} created, 🔄 ${stats.updated} updated, ⏭️ ${stats.skipped} skipped, ⏳ ${stats.skipped_not_started} future.`);
   },
 });
